@@ -66,7 +66,7 @@ $ fq -d tzx dv basic_prog1.tzx
 0x90|71 54 65 73 74 50 72 6f 67                     |qTestProg       |
 0x90|                           26 00               |         &.     |                data_length: 38 0x99-0x9b (2)
 0x90|                                 0a 00         |           ..   |                auto_start_line: 10 0x9b-0x9d (2)
-0x90|                                       26 00   |             &. |                program_length: 38 0x9d-0x9f (2)
+0x90|                                       26 00   |             &. |                variables_offset: 38 0x9d-0x9f (2)
 0x90|                                             01|               .|                checksum: 0x1 (valid) 0x9f-0xa0 (1)
     |                                               |                |    [2]{}: block 0xa0-0xcd (45)
     |                                               |                |      standard_speed_data{}: 0xa0-0xcd (45)

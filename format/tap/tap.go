@@ -1,4 +1,4 @@
-package tzx
+package tap
 
 // https://worldofspectrum.net/zx-modules/fileformats/tapformat.html
 
@@ -38,41 +38,46 @@ func init() {
 func tapDecoder(d *decode.D) any {
 	d.Endian = decode.LittleEndian
 
+	var header headerMetadata
+
 	d.FieldArray("blocks", func(d *decode.D) {
 		for !d.End() {
 			d.FieldStruct("block", func(d *decode.D) {
-				decodeTapBlock(d)
+				// Length of the following data.
+				length := d.FieldU16("length")
+
+				// read header, fragment, or data block
+				switch length {
+				case 0:
+					d.Fatalf("TAP fragments with 0 bytes are not supported")
+				case 1:
+					d.FieldStruct("data", func(d *decode.D) {
+						d.FieldRawLen("bytes", 8)
+					})
+				case 19:
+					d.FieldStruct("header", func(d *decode.D) {
+						header = decodeHeader(d)
+					})
+				default:
+					d.FieldStruct("data", func(d *decode.D) {
+						decodeDataBlock(d, length, &header)
+					})
+				}
+
+				// reset header data when block is not a header
+				if length != 19 {
+					header.reset()
+				}
 			})
 		}
 	})
 	return nil
 }
 
-func decodeTapBlock(d *decode.D) {
-	// Length of the following data.
-	length := d.FieldU16("length")
-
-	// read header, fragment, or data block
-	switch length {
-	case 0:
-		d.Fatalf("TAP fragments with 0 bytes are not supported")
-	case 1:
-		d.FieldStruct("data", func(d *decode.D) {
-			d.FieldRawLen("bytes", 8)
-		})
-	case 19:
-		d.FieldStruct("header", func(d *decode.D) {
-			decodeHeader(d)
-		})
-	default:
-		d.FieldStruct("data", func(d *decode.D) {
-			decodeDataBlock(d, length)
-		})
-	}
-}
-
 // decodes the different types of 19-byte header blocks.
-func decodeHeader(d *decode.D) {
+func decodeHeader(d *decode.D) headerMetadata {
+	blockHeader := headerMetadata{}
+
 	blockStartPosition := d.Pos()
 
 	// flag indicating the type of header block, usually 0 (standard speed data)
@@ -102,21 +107,22 @@ func decodeHeader(d *decode.D) {
 		}
 		return s, nil
 	}))
+	blockHeader.Type = int(dataType)
 
 	// Loading name of the program. Filled with spaces (0x20) to 10 characters.
 	d.FieldStr("program_name", 10, charmap.ISO8859_1)
 
 	switch dataType {
-	case 0:
+	case 0x00:
 		// Length of data following the header = length of BASIC program + variables.
 		d.FieldU16("data_length")
 		// LINE parameter of SAVE command. Value 32768 means "no auto-loading".
 		// 0..9999 are valid line numbers.
 		d.FieldU16("auto_start_line")
-		// Length of BASIC program;
-		// remaining bytes ([data length] - [program length]) = offset of variables.
-		d.FieldU16("program_length")
-	case 1:
+		// Variables area offset, relative to the start of the BASIC program.
+		blockHeader.ProgramVariablesOffset = int(d.FieldU16("variables_offset"))
+		blockHeader.IsBasicProgram = true
+	case 0x01:
 		// Length of data following the header = length of number array * 5 + 3.
 		d.FieldU16("data_length")
 		// Unused byte.
@@ -125,7 +131,7 @@ func decodeHeader(d *decode.D) {
 		d.FieldU8("variable_name", scalar.UintHex)
 		// UnusedWord: 32768.
 		d.FieldU16("unused1")
-	case 2:
+	case 0x02:
 		// Length of data following the header = length of string array + 3.
 		d.FieldU16("data_length")
 		// Unused byte.
@@ -134,7 +140,7 @@ func decodeHeader(d *decode.D) {
 		d.FieldU8("variable_name", scalar.UintHex)
 		// UnusedWord: 32768.
 		d.FieldU16("unused1")
-	case 3:
+	case 0x03:
 		// Length of data following the header, in case of a SCREEN$ header = 6912.
 		d.FieldU16("data_length")
 		// In case of a SCREEN$ header = 16384.
@@ -150,9 +156,11 @@ func decodeHeader(d *decode.D) {
 
 	// Simply all bytes XORed (including flag byte).
 	d.FieldU8("checksum", d.UintValidate(calculateChecksum(d, blockStartPosition, d.Pos()-blockStartPosition)), scalar.UintHex)
+
+	return blockHeader
 }
 
-func decodeDataBlock(d *decode.D, length uint64) {
+func decodeDataBlock(d *decode.D, length uint64, blockHeader *headerMetadata) {
 	blockStartPosition := d.Pos()
 
 	// flag indicating the type of data block, usually 255 (standard speed data)
@@ -164,8 +172,34 @@ func decodeDataBlock(d *decode.D, length uint64) {
 		}
 		return s, nil
 	}))
+
 	// The essential data: length minus the flag/checksum bytes (may be empty)
-	d.FieldRawLen("bytes", int64(length-2)*8)
+	if blockHeader.IsBasicProgram {
+		// when the last header type was "program", parse it as a BASIC program
+		d.FieldStruct("program", func(d *decode.D) {
+			d.FramedFn(int64(blockHeader.ProgramVariablesOffset*8), func(d *decode.D) {
+				d.FieldArray("listing", func(d *decode.D) {
+					for !d.End() {
+						d.FieldStruct("line", func(d *decode.D) {
+							d.Endian = decode.BigEndian
+							d.FieldU16("line_number")
+							d.Endian = decode.LittleEndian
+
+							lineLength := d.FieldU16("byte_length")
+
+							d.FieldStrFn("code", func(d *decode.D) string {
+								data := d.BytesLen(int(lineLength))
+								return decodeBasic(data)
+							})
+						})
+					}
+				})
+			})
+			d.FieldRawLen("variables", int64(int(length)-2-blockHeader.ProgramVariablesOffset)*8)
+		})
+	} else {
+		d.FieldRawLen("bytes", int64(int(length)-2)*8)
+	}
 
 	// Simply all bytes (including flag byte) XORed
 	d.FieldU8("checksum", d.UintValidate(calculateChecksum(d, blockStartPosition, d.Pos()-blockStartPosition)), scalar.UintHex)
@@ -181,4 +215,16 @@ func calculateChecksum(d *decode.D, blockStartPos, blockEndPos int64) uint64 {
 		checksum ^= v
 	}
 	return uint64(checksum)
+}
+
+type headerMetadata struct {
+	Type                   int
+	IsBasicProgram         bool
+	ProgramVariablesOffset int
+}
+
+func (meta *headerMetadata) reset() {
+	meta.Type = -1
+	meta.IsBasicProgram = false
+	meta.ProgramVariablesOffset = 0
 }
